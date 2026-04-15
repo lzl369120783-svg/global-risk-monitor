@@ -1,25 +1,53 @@
 import os
 import sys
 import datetime
+import time
+import hashlib
+import hmac
+import base64
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 修复 Windows 终端 GBK 编码问题
+if sys.platform == 'win32':
+    os.system('chcp 65001 >nul 2>&1')
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except:
+        pass
 
 # 确保能导入当前目录的已有模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import monitor_ashare as fa
 import monitor_global as fg
 
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_FEISHU_WEBHOOK_URL" # <-- 替换为你自己的机器人Webhook
+# 从配置文件读取敏感信息（config.py 不提交 Git）
+try:
+    from config import FEISHU_WEBHOOK, FEISHU_SECRET
+except ImportError:
+    FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_FEISHU_WEBHOOK"
+    FEISHU_SECRET = "YOUR_FEISHU_SECRET"
+
+def gen_sign(secret):
+    """生成飞书机器人签名"""
+    timestamp = str(int(time.time()))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    sign = base64.b64encode(hmac_code).decode("utf-8")
+    return timestamp, sign
 
 def push_to_feishu(md_content):
-    """
-    发送富文本卡片到飞书机器人
-    参考自每天推送论文的逻辑
-    """
+    """发送富文本卡片到飞书机器人（带签名校验）"""
     header = {"Content-Type": "application/json"}
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     
+    timestamp, sign = gen_sign(FEISHU_SECRET)
+    
     payload = {
         "msg_type": "interactive",
+        "timestamp": timestamp,
+        "sign": sign,
         "card": {
             "header": {
                 "title": {
@@ -54,19 +82,72 @@ def push_to_feishu(md_content):
     except Exception as e:
         print("❌ 推送飞书发生网络错误:", str(e))
 
-def generate_report():
-    """
-    调用原有的采集引擎，生成 Markdown 格式的综合报告
-    """
-    print(">>> 正在抓取 A股 数据 (Tushare)...")
-    # --- A股全面获取 ---
-    ts_engine = fa.TushareEngine(fa.TS_TOKEN)
-    margin_val, _ = ts_engine.get_latest_margin()
-    mkt_metrics = ts_engine.get_market_metrics()
-    macro = ts_engine.get_macro_data()
+def fetch_cnbc_fast(symbol):
+    try:
+        return fg.fetch_cnbc(symbol)
+    except:
+        return None, None
 
+def fetch_fred_fast(series_id):
+    try:
+        return fg.fetch_fred(series_id)
+    except:
+        return None, None
+
+def generate_report():
+    """调用数据引擎，生成 Markdown 格式的综合报告"""
+    print(">>> 正在抓取 A股 数据 (AKShare)...")
+    engine = fa.AKShareEngine()
+    margin_val, _ = engine.get_latest_margin()
+    mkt_metrics = engine.get_market_metrics()
+    macro = engine.get_macro_data()
+
+    # ========== A股报告 ==========
     a_share_md = "**🇨🇳 【A股风控雷达】**\n\n"
-    
+
+    # 0. 短线情绪
+    sentiment_data = fa.get_sentiment_data()
+    if sentiment_data:
+        sent = sentiment_data['sentiment']
+        score = sent.get('sentiment_score', 0)
+        verdict = sent.get('verdict', '---')
+        suggestion = sent.get('suggestion', '')
+
+        a_share_md += "*🔥 短线市场情绪*\n"
+        score_emoji = "🔴" if score >= 80 else ("🟢" if score >= 60 else ("🟡" if score >= 40 else "🔴"))
+        a_share_md += f"- **综合情绪评分**: {score} {score_emoji} {verdict}\n"
+
+        mkt_sent = sent.get('market_sentiment', {})
+        mkt_level = mkt_sent.get('level', 0)
+        mkt_verdict = mkt_sent.get('verdict', '')
+        mkt_emoji = {1:"🔴", 2:"🟠", 3:"🟡", 4:"🟢", 5:"🔴"}.get(mkt_level, "⚪")
+        a_share_md += f"- **大盘情绪**: L{mkt_level} {mkt_emoji} {mkt_verdict}\n"
+        for sig in mkt_sent.get('signals', []):
+            a_share_md += f"  · {sig}\n"
+
+        sec_sent = sent.get('sector_sentiment', {})
+        sec_level = sec_sent.get('level', 0)
+        sec_verdict = sec_sent.get('verdict', '')
+        sec_emoji = {1:"🔴", 2:"🟠", 3:"🟡", 4:"🟢", 5:"🔴"}.get(sec_level, "⚪")
+        a_share_md += f"- **题材情绪**: L{sec_level} {sec_emoji} {sec_verdict}\n"
+        for sig in sec_sent.get('signals', []):
+            a_share_md += f"  · {sig}\n"
+
+        if suggestion:
+            a_share_md += f"- 💡 **操作建议**: {suggestion}\n"
+
+        top5 = sentiment_data.get('top5', [])
+        if top5:
+            a_share_md += "  🏆 **Top5标的**: "
+            top_strs = []
+            for s in top5[:5]:
+                lt = s.get('limit_times', 1)
+                tag = f"{lt}连板" if lt > 1 else "首板"
+                top_strs.append(f"{s.get('name','')}{tag}")
+            a_share_md += " | ".join(top_strs) + "\n"
+
+        a_share_md += "\n"
+
     # 1. 资金杠杆
     a_share_md += "*🏛️ 资金杠杆与情绪*\n"
     if margin_val and mkt_metrics:
@@ -80,7 +161,9 @@ def generate_report():
 
     # 2. 经济景气度
     pmi = macro.get('pmi')
-    pmi_month = macro.get('pmi_month', '')[4:]
+    pmi_month = macro.get('pmi_month', '')
+    if len(pmi_month) > 4:
+        pmi_month = pmi_month[4:]
     gdp_yoy = macro.get('gdp_yoy')
     a_share_md += "\n*🏭 经济景气度 (Growth)*\n"
     if pmi is not None:
@@ -101,7 +184,7 @@ def generate_report():
         elif buffett > 80: s_bf = "🟡 估值偏高"
         else: s_bf = "🟢 估值安全"
         a_share_md += f"- **A股总市值**: {total_mv:.2f} 万亿\n"
-        a_share_md += f"- **2025年GDP总量**: {gdp:.2f} 万亿\n"
+        a_share_md += f"- **GDP总量**: {gdp:.2f} 万亿\n"
         a_share_md += f"- **巴菲特指标**: {buffett:.1f}% ({s_bf})\n"
 
     # 4. 通胀与货币
@@ -126,24 +209,56 @@ def generate_report():
     if sf_inc is not None:
         a_share_md += f"- **社融当月增量**: {sf_inc:.0f} 亿\n"
 
+    # ========== 全球报告 ==========
     print(">>> 正在抓取 全球宏观 数据 (CNBC & FRED)...")
-    # --- 全球全面获取 ---
-    btc, btc_chg = fg.fetch_cnbc("BTC.CB=")
-    gold, gold_chg = fg.fetch_cnbc("@GC.1")
-    silver, silver_chg = fg.fetch_cnbc("@SI.1")
-    copper, copper_chg = fg.fetch_cnbc("@HG.1")
-    oil, oil_chg = fg.fetch_cnbc("@CL.1")
+    cnbc_symbols = {
+        'btc': "BTC.CB=", 'gold': "@GC.1", 'silver': "@SI.1",
+        'copper': "@HG.1", 'oil': "@CL.1",
+        'us10y': "US10Y", 'us2y': "US2Y", 'jp10y': "JP10Y",
+        'dxy': ".DXY", 'usdcnh': "CNH=", 'vix': ".VIX"
+    }
+    fred_series = {
+        'hy_spread': "BAMLH0A0HYM2"
+    }
     
-    us10y, us10y_chg = fg.fetch_cnbc("US10Y")
-    us2y, us2y_chg = fg.fetch_cnbc("US2Y")
-    jp10y, jp10y_chg = fg.fetch_cnbc("JP10Y")
-    dxy, dxy_chg = fg.fetch_cnbc(".DXY")
-    usdcnh, usdcnh_chg = fg.fetch_cnbc("CNH=")
-    vix, vix_chg = fg.fetch_cnbc(".VIX")
+    # CNBC 替代 FRED 的 TIPS 数据（国内可访问）
+    cnbc_symbols['tips_10y'] = "US10YTIP"
     
-    hy_spread, _ = fg.fetch_fred("BAMLH0A0HYM2")
-    real_yield_10y, _ = fg.fetch_fred("DFII10")
-    rrp_liq, _ = fg.fetch_fred("RRPONTSYD")
+    all_data = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        for key, sym in cnbc_symbols.items():
+            futures[executor.submit(fetch_cnbc_fast, sym)] = ('cnbc', key)
+        for key, sid in fred_series.items():
+            futures[executor.submit(fetch_fred_fast, sid)] = ('fred', key)
+        for future in as_completed(futures, timeout=30):
+            try:
+                result = future.result(timeout=10)
+                src, key = futures[future]
+                all_data[key] = result
+            except:
+                pass
+
+    def get_val(key): return all_data.get(key, (None, None))[0]
+    def get_chg(key): return all_data.get(key, (None, None))[1]
+
+    btc, btc_chg = get_val('btc'), get_chg('btc')
+    gold, gold_chg = get_val('gold'), get_chg('gold')
+    silver, silver_chg = get_val('silver'), get_chg('silver')
+    copper, copper_chg = get_val('copper'), get_chg('copper')
+    oil, oil_chg = get_val('oil'), get_chg('oil')
+    us10y, us10y_chg = get_val('us10y'), get_chg('us10y')
+    us2y, us2y_chg = get_val('us2y'), get_chg('us2y')
+    jp10y, jp10y_chg = get_val('jp10y'), get_chg('jp10y')
+    dxy, dxy_chg = get_val('dxy'), get_chg('dxy')
+    usdcnh, usdcnh_chg = get_val('usdcnh'), get_chg('usdcnh')
+    vix, vix_chg = get_val('vix'), get_chg('vix')
+    hy_spread = get_val('hy_spread')
+    tips_10y = get_val('tips_10y')
+    real_yield_10y = tips_10y
+    breakeven_inflation = None
+    if us10y and tips_10y:
+        breakeven_inflation = us10y - tips_10y
 
     global_md = "\n---\n**🌍 【全球周期罗盘】**\n\n"
     
@@ -165,25 +280,77 @@ def generate_report():
         _, ft_txt = fg.analyze_4th_turning(vix, gold)
         global_md += f"- **第四次转折(地缘)**: {ft_txt}\n"
 
-    # 2. 宏观比价
+    # 2. 宏观比价 + 解读
     global_md += "\n*⚖️ 宏观比价*\n"
+    gs_val = None
+    go_val = None
     if gold and silver:
-        gs = gold / silver
-        s_gs = "🔴 通缩/避险" if gs > 85 else ("🟡 需关注" if gs > 70 else "🟢 复苏/通胀")
-        global_md += f"- **金银比 (G/S)**: {gs:.1f} ({s_gs})\n"
+        gs_val = gold / silver
+        s_gs = "🔴 通缩/避险" if gs_val > 85 else ("🟡 需关注" if gs_val > 70 else "🟢 复苏/通胀")
+        global_md += f"- **金银比 (G/S)**: {gs_val:.1f} ({s_gs})\n"
+        global_md += f"  > 金银比>85=恐惧(通缩)，<70=贪婪(复苏)\n"
     if gold and oil:
-        go = gold / oil
-        s_go = "🔴 极度衰退/战争" if go > 50 else ("🟡 避险主导" if go > 30 else "🟢 需求正常")
-        global_md += f"- **金油比 (Au/Oil)**: {go:.1f} ({s_go})\n"
+        go_val = gold / oil
+        s_go = "🔴 极度衰退/战争" if go_val > 50 else ("🟡 避险主导" if go_val > 30 else "🟢 需求正常")
+        global_md += f"- **金油比 (Au/Oil)**: {go_val:.1f} ({s_go})\n"
+        global_md += f"  > 金油比>50=经济停摆，<30=需求正常\n"
+    if cg_ratio:
+        s_cg = "🟢 经济扩张" if cg_ratio > 0.20 else ("🟡 增长放缓" if cg_ratio > 0.15 else "🔴 衰退风险")
+        global_md += f"- **铜金比 (Cu/Au)**: {cg_ratio:.2f} ({s_cg})\n"
+        global_md += f"  > 铜金比上升=资金回流实业，下降=衰退预警\n"
+    if gold and copper:
+        gc = gold / copper
+        s_gc = "🔴 避险爆表" if gc > 750 else ("🟡 避险升温" if gc > 650 else "🟢 情绪稳定")
+        global_md += f"- **金铜比 (Au/Cu)**: {gc:.1f} ({s_gc})\n"
+        global_md += f"  > 金铜比>750=避险远超实业，经济冰点\n"
+
+    # 综合研判
+    global_md += "\n*🔑 综合研判*\n"
+    signals = []
+    if gs_val and gs_val < 70:
+        signals.append(("🟢", "金银比偏低→白银强，工业需求尚可"))
+    elif gs_val and gs_val > 85:
+        signals.append(("🔴", "金银比偏高→避险情绪浓厚，通缩压力"))
+    if go_val and go_val > 50:
+        signals.append(("🔴", "金油比过50→油价弱或金价强，经济运转不畅"))
+    elif go_val and go_val < 30:
+        signals.append(("🟢", "金油比正常→原油需求旺盛，经济活跃"))
+    if cg_ratio and cg_ratio < 0.15:
+        signals.append(("🔴", "铜金比偏低→铜弱金强，实业萎缩"))
+    elif cg_ratio and cg_ratio > 0.20:
+        signals.append(("🟢", "铜金比偏高→资金回流实业，经济扩张"))
+    if vix and vix > 20:
+        signals.append(("🟡", "VIX偏高→市场波动加剧，注意风险"))
+    elif vix and vix < 15:
+        signals.append(("🟢", "VIX低位→市场平稳，风险偏好较好"))
+    
+    if not signals:
+        global_md += "暂无明显信号\n"
+    else:
+        red_count = sum(1 for s in signals if s[0] == "🔴")
+        green_count = sum(1 for s in signals if s[0] == "🟢")
+        for icon, text in signals:
+            global_md += f"- {icon} {text}\n"
+        if red_count >= 2:
+            global_md += "\n⚠️ **多重衰退信号共振，建议防御为主，关注黄金板块和低估值品种**\n"
+        elif green_count >= 2:
+            global_md += "\n✅ **复苏信号占优，可关注顺周期品种和成长股**\n"
+        else:
+            global_md += "\n🔄 **信号分歧，建议均衡配置，既守又攻**\n"
 
     # 3. 流动性与债市
-    global_md += "\n*💧 流动性与债市*\n"
+    global_md += "\n*💧 流动性与通胀*\n"
     if real_yield_10y is not None:
         s_ry = "🟢 宽松/金牛" if real_yield_10y < 1.0 else "🔴 紧缩/杀估值"
-        global_md += f"- **10Y真实利率**: {real_yield_10y:.2f}% ({s_ry})\n"
-    if rrp_liq is not None:
-        s_rrp = "🔴 流动性枯竭" if rrp_liq < 300 else "🟢 资金充裕"
-        global_md += f"- **逆回购规模(RRP)**: {rrp_liq:,.0f} B ({s_rrp})\n"
+        global_md += f"- **10Y真实利率(TIPS)**: {real_yield_10y:.2f}% ({s_ry})\n"
+    else:
+        global_md += f"- **10Y真实利率(TIPS)**: 数据缺失\n"
+    if breakeven_inflation is not None:
+        s_be = "🟢 通胀温和" if breakeven_inflation < 2.0 else ("🟡 通胀偏高" if breakeven_inflation < 3.0 else "🔴 通胀过热")
+        global_md += f"- **盈亏平衡通胀预期**: {breakeven_inflation:.2f}% ({s_be})\n"
+        global_md += f"  > 通胀预期=10Y名义利率-TIPS真实利率，反映市场对未来10年通胀的定价\n"
+    else:
+        global_md += f"- **盈亏平衡通胀预期**: 需10Y+TIPS数据\n"
     if us10y and jp10y:
         global_md += f"- **美日利差**: {(us10y - jp10y) * 100:.0f} bp\n"
 
@@ -194,7 +361,10 @@ def generate_report():
     s_vix = "🔴 极度恐慌" if vix and vix > 30 else ("🟡 波动加剧" if vix and vix > 20 else "🟢 市场平稳")
     global_md += f"- **VIX恐慌指数**: {vix} ({s_vix})\n"
     
-    global_md += f"- 🪙 **BTC**: ${btc:,.2f} | 🌕 **黄金**: ${gold:,.2f} | 🛢️ **原油**: ${oil:,.2f}\n"
+    btc_str = f"${btc:,.2f}" if btc else "N/A"
+    gold_str = f"${gold:,.2f}" if gold else "N/A"
+    oil_str = f"${oil:,.2f}" if oil else "N/A"
+    global_md += f"- 🪙 **BTC**: {btc_str} | 🌕 **黄金**: {gold_str} | 🛢️ **原油**: {oil_str}\n"
 
     return a_share_md + global_md
 

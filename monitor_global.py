@@ -9,6 +9,15 @@ import unicodedata
 import threading
 import itertools
 
+# 修复 Windows 终端 GBK 编码问题
+if sys.platform == 'win32':
+    os.system('chcp 65001 >nul 2>&1')
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except:
+        pass
+
 # 禁用SSL安全警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -73,11 +82,11 @@ def _patched_request(self, method, url, *args, **kwargs):
     return _original_request(self, method, url, *args, **kwargs)
 requests.Session.request = _patched_request
 
-def fetch_with_retry(url, parser_func, retries=3):
+def fetch_with_retry(url, parser_func, retries=3, timeout=10):
     for i in range(retries):
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=timeout)
             result = parser_func(res.text)
             if result[0] is not None: return result
         except: pass
@@ -89,20 +98,25 @@ def fetch_with_retry(url, parser_func, retries=3):
 # ==============================================================================
 def parse_cnbc(text):
     price, pct = None, None
-    match_price = re.search(r'"last":"(\d+\.?\d*)"', text)
-    if match_price: price = float(match_price.group(1))
-    
+
+    # 优先尝试 change_pct 正则（已验证有效）
     match_pct = re.search(r'"change_pct":"(.*?)"', text)
     if match_pct:
-        try: pct = float(match_pct.group(1).replace('%', ''))
-        except: pct = 0.0
-            
-    if price is None:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(text, 'html.parser')
-        tag = soup.find("span", class_="QuoteStrip-lastPrice")
-        if tag: price = float(tag.text.strip().replace('%', '').replace(',', ''))
-            
+        try:
+            pct = float(match_pct.group(1).replace('%', ''))
+        except:
+            pct = 0.0
+
+    # 改用 BeautifulSoup 解析价格（正则 "last" 已失效）
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(text, 'html.parser')
+    tag = soup.find("span", class_="QuoteStrip-lastPrice")
+    if tag:
+        try:
+            price = float(tag.text.strip().replace(',', '').replace('%', ''))
+        except:
+            pass
+
     return price, pct
 
 def parse_fred(text):
@@ -113,10 +127,10 @@ def parse_fred(text):
     return None, None
 
 def fetch_cnbc(symbol):
-    return fetch_with_retry(f"https://www.cnbc.com/quotes/{symbol}", parse_cnbc)
+    return fetch_with_retry(f"https://www.cnbc.com/quotes/{symbol}", parse_cnbc, retries=2, timeout=10)
 
 def fetch_fred(series_id):
-    return fetch_with_retry(f"https://fred.stlouisfed.org/series/{series_id}", parse_fred)
+    return fetch_with_retry(f"https://fred.stlouisfed.org/series/{series_id}", parse_fred, retries=1, timeout=5)
 
 # ==============================================================================
 # 4. 渲染工具
@@ -225,27 +239,55 @@ def main():
     t.start()
     
     try:
-        # --- 基础资产 ---
-        btc, btc_chg = fetch_cnbc("BTC.CB=")
-        gold, gold_chg = fetch_cnbc("@GC.1")
-        silver, silver_chg = fetch_cnbc("@SI.1")
-        copper, copper_chg = fetch_cnbc("@HG.1")
-        oil, oil_chg = fetch_cnbc("@CL.1")
+        # 并发获取所有数据，大幅缩短加载时间
+        results = {}
+        def _fetch(name, func, *args):
+            results[name] = func(*args)
 
-        # --- 利率 ---
-        us10y, us10y_chg = fetch_cnbc("US10Y")
-        us2y, us2y_chg = fetch_cnbc("US2Y")
-        jp10y, jp10y_chg = fetch_cnbc("JP10Y")
+        threads = []
+        fetch_tasks = [
+            ("btc", fetch_cnbc, "BTC.CB="),
+            ("gold", fetch_cnbc, "@GC.1"),
+            ("silver", fetch_cnbc, "@SI.1"),
+            ("copper", fetch_cnbc, "@HG.1"),
+            ("oil", fetch_cnbc, "@CL.1"),
+            ("us10y", fetch_cnbc, "US10Y"),
+            ("us2y", fetch_cnbc, "US2Y"),
+            ("jp10y", fetch_cnbc, "JP10Y"),
+            ("dxy", fetch_cnbc, ".DXY"),
+            ("usdcnh", fetch_cnbc, "CNH="),
+            ("vix", fetch_cnbc, ".VIX"),
+            # FRED 数据改用 CNBC 替代（国内可访问）
+            ("tips_10y", fetch_cnbc, "US10YTIP"),
+            # 高收益债利差: CNBC 无直接页面，用 BAML 替代
+            ("hy_spread", fetch_fred, "BAMLH0A0HYM2"),
+        ]
+        for name, func, *args in fetch_tasks:
+            t = threading.Thread(target=_fetch, args=(name, func, *args))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
-        # --- 宏观数据 ---
-        dxy, dxy_chg = fetch_cnbc(".DXY")
-        usdcnh, usdcnh_chg = fetch_cnbc("CNH=")
-        vix, vix_chg = fetch_cnbc(".VIX")
-        
-        # FRED 数据
-        hy_spread, _ = fetch_fred("BAMLH0A0HYM2")
-        real_yield_10y, _ = fetch_fred("DFII10")
-        rrp_liq, _ = fetch_fred("RRPONTSYD")
+        btc, btc_chg = results["btc"]
+        gold, gold_chg = results["gold"]
+        silver, silver_chg = results["silver"]
+        copper, copper_chg = results["copper"]
+        oil, oil_chg = results["oil"]
+        us10y, us10y_chg = results["us10y"]
+        us2y, us2y_chg = results["us2y"]
+        jp10y, jp10y_chg = results["jp10y"]
+        dxy, dxy_chg = results["dxy"]
+        usdcnh, usdcnh_chg = results["usdcnh"]
+        vix, vix_chg = results["vix"]
+        hy_spread, _ = results["hy_spread"]
+        tips_10y, _ = results.get("tips_10y", (None, None))
+        # 计算 10Y 真实利率 = CNBC TIPS 直接获取
+        real_yield_10y = tips_10y
+        # 计算通胀预期 = 名义10Y - TIPS 10Y（盈亏平衡通胀率）
+        breakeven_inflation = None
+        if us10y and tips_10y:
+            breakeven_inflation = us10y - tips_10y
 
     finally:
         done = True
@@ -321,14 +363,14 @@ def main():
         s = "🟢 利率宽松/金牛" if real_yield_10y < 1.0 else "🔴 紧缩/杀估值"
         print_row("🛡️ 10Y真实利率(TIPS)", real_yield_10y, None, "%", c, s)
     else:
-        print_row("🛡️ 10Y真实利率(TIPS)", None, None, "%", Colors.GREY, "FRED数据缺失")
+        print_row("🛡️ 10Y真实利率(TIPS)", None, None, "%", Colors.GREY, "数据缺失")
 
-    if rrp_liq is not None:
-        c = Colors.RED if rrp_liq < 300 else Colors.GREEN
-        s = "🔴 流动性枯竭" if rrp_liq < 300 else "🟢 资金充裕"
-        print_row("🏦 逆回购规模(RRP)", rrp_liq, None, "B", c, s)
+    if breakeven_inflation is not None:
+        c = Colors.GREEN if breakeven_inflation < 2.0 else (Colors.YELLOW if breakeven_inflation < 3.0 else Colors.RED)
+        s = "🟢 通胀温和" if breakeven_inflation < 2.0 else ("🟡 通胀偏高" if breakeven_inflation < 3.0 else "🔴 通胀过热")
+        print_row("📈 盈亏平衡通胀预期", breakeven_inflation, None, "%", c, s)
     else:
-        print_row("🏦 逆回购规模(RRP)", None, None, "B", Colors.GREY, "FRED数据缺失")
+        print_row("📈 盈亏平衡通胀预期", None, None, "%", Colors.GREY, "需10Y+TIPS数据")
 
     # 5. 债市利率
     print_category_header("🆎 债市利率 (Bonds & Rates)")

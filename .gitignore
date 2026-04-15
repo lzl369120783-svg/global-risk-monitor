@@ -1,0 +1,24 @@
+# 虚拟环境
+venv/
+__pycache__/
+*.pyc
+
+# 敏感配置
+config.py
+*_token*
+*_secret*
+*_webhook*
+*_key*
+
+# 临时文件
+test_*.py
+test_*.bat
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# 数据缓存
+*.csv
+*.xlsx
