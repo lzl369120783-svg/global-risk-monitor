@@ -114,12 +114,12 @@ class AKShareEngine:
             if len(sh_float) > 0:
                 float_mv += float(sh_float.iloc[0]['股票'])
 
-            # 深市
+            # 深市（单位是元，需要转成亿元）
             df_sz = ak.stock_szse_summary()
             sz_stock = df_sz[df_sz['证券类别'] == '股票']
             if len(sz_stock) > 0:
-                total_mv += float(sz_stock.iloc[0]['总市值'])
-                float_mv += float(sz_stock.iloc[0]['流通市值'])
+                total_mv += float(sz_stock.iloc[0]['总市值']) / 1e8  # 元 -> 亿元
+                float_mv += float(sz_stock.iloc[0]['流通市值']) / 1e8  # 元 -> 亿元
 
             # 转换为万亿（原始单位：亿元）
             return {
